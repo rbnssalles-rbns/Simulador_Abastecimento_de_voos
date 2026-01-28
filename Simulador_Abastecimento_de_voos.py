@@ -1,0 +1,128 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+import streamlit as st
+import pandas as pd
+import easyocr
+import re
+
+st.set_page_config(page_title="Simulador de Abastecimento de Voos", layout="wide")
+
+st.title("✈️ Simulador de Abastecimento de Voos")
+
+# Upload do arquivo Excel com estoque e receitas
+uploaded_file = st.file_uploader("Carregue o arquivo de estoque e refeições (.xlsx)", type=["xlsx"])
+
+if uploaded_file:
+    df_itens = pd.read_excel(uploaded_file, sheet_name="Cadastro de Itens")
+    df_refeicoes = pd.read_excel(uploaded_file, sheet_name="Definição de Refeições")
+
+    # Cache para manter estoque atualizado
+    if "estoque" not in st.session_state:
+        st.session_state.estoque = df_itens.copy()
+
+    st.subheader("📦 Estoque Atual")
+    st.dataframe(st.session_state.estoque)
+
+    # Escolha do método de entrada de voos
+    metodo = st.radio("Selecione o método de entrada de voos:", ["Excel", "Imagens"])
+
+    df_voos = None
+
+    # --- OPÇÃO 1: Excel ---
+    if metodo == "Excel":
+        uploaded_voos = st.file_uploader("Carregue programação de voos (.xlsx)", type=["xlsx"])
+        if uploaded_voos:
+            df_voos = pd.read_excel(uploaded_voos, sheet_name="Programação de Voos")
+            st.subheader("🛫 Programação de Voos (Excel)")
+            st.dataframe(df_voos)
+
+    # --- OPÇÃO 2: Imagens com EasyOCR ---
+    if metodo == "Imagens":
+        uploaded_images = st.file_uploader("Carregue imagens dos voos", type=["jpg","jpeg","png"], accept_multiple_files=True)
+        if uploaded_images:
+            reader = easyocr.Reader(['pt'])
+            dados_voos = []
+            for img_file in uploaded_images:
+                results = reader.readtext(img_file.read())
+                texto = " ".join([res[1] for res in results])
+
+                # Mostrar texto OCR bruto para conferência
+                st.text_area("Texto extraído da imagem", texto, height=200)
+
+                # Parsing automático com regex
+                voo = re.search(r"(LA|TP|G3)\s*\d{3,4}", texto)
+                partida = re.search(r"(\d{2}/\d{2}/\d{4}).*?(\d{2}:\d{2})", texto)
+                chegada = re.search(r"ETA.*?(\d{2}/\d{2}/\d{4}).*?(\d{2}:\d{2})", texto)
+                rota = re.search(r"[A-Z]{3}\s*[-–]\s*[A-Z]{3}", texto)
+                classeA = re.search(r"J\s+(\d{1,3})", texto)
+                classeB = re.search(r"Y\s+(\d{1,3})", texto)
+
+                dados_voos.append({
+                    "Nº do Voo": voo.group(0) if voo else None,
+                    "Data": partida.group(1) if partida else None,
+                    "Horário Partida": partida.group(2) if partida else None,
+                    "Horário Chegada": chegada.group(2) if chegada else None,
+                    "Rota": rota.group(0) if rota else None,
+                    "Passageiros Classe A": int(classeA.group(1)) if classeA else 0,
+                    "Passageiros Classe B": int(classeB.group(1)) if classeB else 0,
+                    "Passageiros Classe C": 0
+                })
+
+            df_voos = pd.DataFrame(dados_voos)
+            st.subheader("🛫 Programação de Voos (Imagens OCR)")
+            st.dataframe(df_voos)
+
+    # --- SIMULAÇÃO INDIVIDUAL POR VOO ---
+    if df_voos is not None and not df_voos.empty:
+        st.subheader("🍽️ Simulação de Consumo por Voo")
+
+        regras = {
+            "Classe A": {"Refeição Executiva": 1, "Lanche": 0},
+            "Classe B": {"Refeição Executiva": 1, "Lanche": 1},
+            "Classe C": {"Refeição Executiva": 0, "Lanche": 1},
+        }
+
+        for _, voo in df_voos.iterrows():
+            consumo_voo = []
+            passageiros = {
+                "Classe A": voo.get("Passageiros Classe A", 0),
+                "Classe B": voo.get("Passageiros Classe B", 0),
+                "Classe C": voo.get("Passageiros Classe C", 0),
+            }
+
+            for classe, qtd in passageiros.items():
+                for tipo_ref, vezes in regras[classe].items():
+                    for _, row in df_refeicoes[df_refeicoes["Tipo de Refeição"] == tipo_ref].iterrows():
+                        consumo_voo.append({
+                            "ID Item": row["ID Item"],
+                            "Item": row["Item"],
+                            "Quantidade": row["Quantidade"] * qtd * vezes,
+                            "Voo": voo.get("Nº do Voo", "Desconhecido")
+                        })
+
+            df_consumo_voo = pd.DataFrame(consumo_voo).groupby(["ID Item", "Item"]).sum().reset_index()
+
+            st.subheader(f"🍽️ Consumo do Voo {voo.get('Nº do Voo', 'Desconhecido')}")
+            st.dataframe(df_consumo_voo)
+
+            # Atualizar estoque
+            for _, row in df_consumo_voo.iterrows():
+                st.session_state.estoque.loc[
+                    st.session_state.estoque["ID"] == row["ID Item"], "Estoque inicial"
+                ] -= row["Quantidade"]
+
+        # --- RELATÓRIO DE REPOSIÇÃO ---
+        st.subheader("📊 Relatório de Reposição")
+        limite_minimo = 5000  # exemplo de limite mínimo
+        df_reposicao = st.session_state.estoque[st.session_state.estoque["Estoque inicial"] < limite_minimo]
+        st.dataframe(df_reposicao)
+
+        if not df_reposicao.empty:
+            st.warning("⚠️ É necessário repor os itens listados acima.")
+else:
+    st.info("Carregue o arquivo Excel de estoque e receitas para iniciar a simulação.")
+
